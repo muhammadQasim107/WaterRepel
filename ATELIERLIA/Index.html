@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Fullscreen Water Ripple</title>
+  <style>
+    body { margin: 0; overflow: hidden; }
+    canvas { display: block; }
+  </style>
+</head>
+<body>
+<script type="module">
+import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.153.0/build/three.module.js';
+
+const simRes = 512;
+
+const renderer = new THREE.WebGLRenderer();
+renderer.setSize(window.innerWidth, window.innerHeight);
+document.body.appendChild(renderer.domElement);
+
+// Fullscreen orthographic camera
+const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+const scene = new THREE.Scene();
+
+// Load base texture
+const loader = new THREE.TextureLoader();
+const baseTexture = loader.load('./Images/Test.webp', () => {
+  baseTexture.minFilter = THREE.LinearFilter;
+  baseTexture.magFilter = THREE.LinearFilter;
+  baseTexture.wrapS = THREE.ClampToEdgeWrapping;
+  baseTexture.wrapT = THREE.ClampToEdgeWrapping;
+});
+
+// Initial simulation texture
+const initialData = new Float32Array(simRes * simRes * 4);
+const initialTexture = new THREE.DataTexture(initialData, simRes, simRes, THREE.RGBAFormat, THREE.FloatType);
+initialTexture.needsUpdate = true;
+
+// Ping-pong render targets
+const rt1 = new THREE.WebGLRenderTarget(simRes, simRes, {
+  type: THREE.FloatType,
+  minFilter: THREE.NearestFilter,
+  magFilter: THREE.NearestFilter,
+  wrapS: THREE.ClampToEdgeWrapping,
+  wrapT: THREE.ClampToEdgeWrapping
+});
+const rt2 = rt1.clone();
+
+// Simulation shader
+const simMaterial = new THREE.ShaderMaterial({
+  vertexShader: `varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position, 1.0); }`,
+  fragmentShader: `
+    precision highp float;
+    uniform sampler2D prevTexture;
+    uniform vec2 iResolution;
+    uniform vec2 iMouse;
+    uniform float delta;
+    varying vec2 vUv;
+
+    void main() {
+      vec2 texel = 1.0 / iResolution;
+      vec4 data = texture2D(prevTexture, vUv);
+      float pressure = data.x;
+      float pVel = data.y;
+
+      float p_right = texture2D(prevTexture, vUv + vec2(texel.x, 0.0)).x;
+      float p_left  = texture2D(prevTexture, vUv - vec2(texel.x, 0.0)).x;
+      float p_up    = texture2D(prevTexture, vUv + vec2(0.0, texel.y)).x;
+      float p_down  = texture2D(prevTexture, vUv - vec2(0.0, texel.y)).x;
+
+      pVel += delta * (-2.0 * pressure + p_right + p_left) / 4.0;
+      pVel += delta * (-2.0 * pressure + p_up + p_down) / 4.0;
+      pressure += delta * pVel;
+
+      pVel -= 0.003 * delta * pressure;
+      pVel *= 1.0 - 0.002 * delta;
+      pressure *= 0.982;
+
+      // Mouse ripple always on movement (no click needed)
+      float dist = distance(vUv * iResolution, iMouse);
+      if(dist < 15.0) {
+          pressure += 1.0 - dist / 15.0;
+      }
+
+      float gradX = (p_right - p_left) * 0.5;
+      float gradY = (p_up - p_down) * 0.5;
+      gl_FragColor = vec4(pressure, pVel, gradX, gradY);
+    }
+  `,
+  uniforms: {
+    prevTexture: { value: initialTexture },
+    iResolution: { value: new THREE.Vector2(simRes, simRes) },
+    iMouse: { value: new THREE.Vector2(-1000, -1000) },
+    delta: { value: 1.0 }
+  }
+});
+
+// Render shader
+const renderMaterial = new THREE.ShaderMaterial({
+  vertexShader: `varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position, 1.0); }`,
+  fragmentShader: `
+    precision highp float;
+    uniform sampler2D baseTexture;
+    uniform sampler2D simTexture;
+    varying vec2 vUv;
+
+    void main() {
+      vec4 simData = texture2D(simTexture, vUv);
+      vec2 grad = simData.zw;
+      vec2 displacedUv = vUv + grad * 0.15;
+      displacedUv = clamp(displacedUv, 0.0, 2.0);
+      vec4 color = texture2D(baseTexture, displacedUv);
+
+      // Lighting
+      vec3 normal = normalize(vec3(-grad.x, 0.2, -grad.y));
+      float light = pow(max(dot(normal, normalize(vec3(-3.0, 10.0, 3.0))), 0.0), 60.0);
+      color.rgb += vec3(light);
+
+      gl_FragColor = color;
+    }
+  `,
+  uniforms: {
+    baseTexture: { value: baseTexture },
+    simTexture: { value: rt1.texture }
+  }
+});
+
+// Fullscreen quad
+const quadGeometry = new THREE.PlaneGeometry(2, 2);
+const screenMesh = new THREE.Mesh(quadGeometry, renderMaterial);
+scene.add(screenMesh);
+
+// Simulation scene
+const simScene = new THREE.Scene();
+const simQuad = new THREE.Mesh(quadGeometry, simMaterial);
+simScene.add(simQuad);
+
+// Mouse tracking
+let mouse = new THREE.Vector2(-1000, -1000);
+
+renderer.domElement.addEventListener('mousemove', (e) => {
+  const rect = renderer.domElement.getBoundingClientRect();
+  mouse.x = (e.clientX - rect.left) * (simRes / rect.width);
+  mouse.y = simRes - (e.clientY - rect.top) * (simRes / rect.height);
+  simMaterial.uniforms.iMouse.value = mouse;
+});
+
+const clock = new THREE.Clock();
+let currentRT = rt1;
+let prevRT = rt2;
+
+function animate() {
+  requestAnimationFrame(animate);
+
+  simMaterial.uniforms.delta.value = 1.0;
+  simMaterial.uniforms.prevTexture.value = prevRT.texture;
+
+  // Run simulation
+  renderer.setRenderTarget(currentRT);
+  renderer.render(simScene, camera);
+  renderer.setRenderTarget(null);
+
+  // Ping-pong
+  [prevRT, currentRT] = [currentRT, prevRT];
+  renderMaterial.uniforms.simTexture.value = prevRT.texture;
+
+  // Render final output
+  renderer.render(scene, camera);
+}
+
+animate();
+
+window.addEventListener('resize', () => {
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+</script>
+</body>
+</html>
